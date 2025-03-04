@@ -1,0 +1,7 @@
+VOC2012/
+COCO/
+DAVIS/
+checkpoints/
+__pycache__/
+*.pyc
+*.pyo
