@@ -61,7 +61,11 @@ def load_image_and_mask(image_path, mask_path, dataset_type=None):
                         h, w = image.shape[:2]
                         rles = mask_utils.frPyObjects(ann['segmentation'], h, w)
                         instance_mask = mask_utils.decode(rles)
-                    binary_mask = np.logical_or(binary_mask, instance_mask.astype(bool))
+                    
+                    # Ensure instance_mask is 2D
+                    if instance_mask.ndim == 3:
+                        instance_mask = np.any(instance_mask, axis=2)
+                    binary_mask = np.logical_or(binary_mask, instance_mask)
     
     elif dataset_type == "VOC2012":
         # For VOC2012, mask is a PNG file with instance segmentations
