@@ -21,18 +21,34 @@ def download_file(url, dest_path):
             bar.update(len(data))
     print(f"[INFO] Download complete: {dest_path}")
 
-def extract_file(file_path, extract_to, file_type="zip"):
-    """Extract a zip or tar archive to a given directory."""
-    print(f"[INFO] Extracting {file_path} to {extract_to}")
-    if file_type == "zip":
+def extract_file(file_path, extract_to):
+    """
+    Automatically extract an archive (zip or tar) to a given directory.
+    Provides debugging output if the file appears too small.
+    """
+    # Check file size; if too small, print the first few bytes as text for debugging.
+    file_size = os.path.getsize(file_path)
+    if file_size < 100 * 1024:  # less than 100 KB
+        print(f"[DEBUG] Warning: {file_path} is very small ({file_size} bytes).")
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read(300)
+            print(f"[DEBUG] File content preview (first 300 chars):\n{content}")
+        except Exception as e:
+            print(f"[DEBUG] Unable to read file content: {e}")
+
+    if zipfile.is_zipfile(file_path):
+        print(f"[INFO] Extracting ZIP file {file_path} to {extract_to}")
         with zipfile.ZipFile(file_path, "r") as zip_ref:
             zip_ref.extractall(extract_to)
-    elif file_type == "tar":
+        print(f"[INFO] Extraction complete.")
+    elif tarfile.is_tarfile(file_path):
+        print(f"[INFO] Extracting TAR file {file_path} to {extract_to}")
         with tarfile.open(file_path, "r") as tar_ref:
             tar_ref.extractall(extract_to)
+        print(f"[INFO] Extraction complete.")
     else:
-        raise ValueError("Unsupported file type. Use 'zip' or 'tar'.")
-    print(f"[INFO] Extraction complete.")
+        raise ValueError(f"Unsupported archive format or corrupted file: {file_path}")
 
 def download_sam_checkpoint(model_type="vit_h", save_dir="checkpoints"):
     """
@@ -62,7 +78,7 @@ def download_pascal_voc(dest_dir="VOC2012"):
     voc_url = "http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCtrainval_11-May-2012.tar"
     tar_path = os.path.join(dest_dir, "VOCtrainval_11-May-2012.tar")
     download_file(voc_url, tar_path)
-    extract_file(tar_path, dest_dir, file_type="tar")
+    extract_file(tar_path, dest_dir)
     return dest_dir
 
 def download_coco(dest_dir="COCO"):
@@ -80,20 +96,41 @@ def download_coco(dest_dir="COCO"):
     download_file(coco_images_url, images_zip_path)
     download_file(coco_ann_url, ann_zip_path)
     
-    extract_file(images_zip_path, dest_dir, file_type="zip")
-    extract_file(ann_zip_path, dest_dir, file_type="zip")
+    extract_file(images_zip_path, dest_dir)
+    extract_file(ann_zip_path, dest_dir)
     return dest_dir
 
-def download_davis(dest_dir="DAVIS"):
+
+def extract_zip_file(file_path, extract_to):
+    """Extracts a ZIP file to a given directory."""
+    print(f"[INFO] Extracting ZIP file {file_path} to {extract_to}")
+    try:
+        with zipfile.ZipFile(file_path, "r") as zip_ref:
+            zip_ref.extractall(extract_to)
+        print(f"[INFO] Extraction complete.")
+    except zipfile.BadZipFile:
+        print(f"[ERROR] The file {file_path} appears to be corrupted. Please delete and re-download.")
+        exit(1)
+
+def download_davis_2016(dest_dir="DAVIS"):
     """
-    Download DAVIS 2017 train/val dataset (480p version).
+    Download DAVIS 2016 dataset from the official source and extract it.
     """
     os.makedirs(dest_dir, exist_ok=True)
-    davis_url = "https://data.vision.ee.ethz.ch/cvl/DAVIS/2017/DAVIS-2017-trainval-480p.zip"
-    zip_path = os.path.join(dest_dir, "DAVIS-2017-trainval-480p.zip")
+    
+    davis_url = "https://graphics.ethz.ch/Downloads/Data/Davis/DAVIS-data.zip"
+    zip_path = os.path.join(dest_dir, "DAVIS-data.zip")
+    
     download_file(davis_url, zip_path)
-    extract_file(zip_path, dest_dir, file_type="zip")
+    extract_zip_file(zip_path, dest_dir)
+    
+    # Clean up the zip file after extraction
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+        print(f"[INFO] Removed temporary file: {zip_path}")
+    
     return dest_dir
+
 
 def main():
     # Download SAM checkpoint
@@ -111,10 +148,11 @@ def main():
     coco_dir = download_coco(dest_dir="COCO")
     print(f"COCO 2017 downloaded and extracted to: {coco_dir}\n")
     
-    # Download DAVIS 2017
-    print("== Downloading DAVIS 2017 Dataset ==")
-    davis_dir = download_davis(dest_dir="DAVIS")
-    print(f"DAVIS 2017 downloaded and extracted to: {davis_dir}\n")
+    # Download DAVIS 2016
+    print("== Downloading DAVIS 2016 Dataset ==")
+    davis_dir = download_davis_2016(dest_dir="DAVIS")
+    print(f"DAVIS 2016 downloaded and extracted to: {davis_dir}\n")
+
     
     print("== All files have been downloaded and extracted ==")
 
