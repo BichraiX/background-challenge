@@ -1,11 +1,10 @@
 import os
 import random
 import numpy as np
-import matplotlib.pyplot as plt
 
-# Import SAM modules – make sure you have cloned Meta’s SAM repo and installed its dependencies
+# Import SAM modules – make sure you have cloned Meta's SAM repo and installed its dependencies
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
-from utils import load_image_and_mask, compute_iou, compute_dice
+from utils import load_image_and_mask, compute_iou, compute_dice, plot_metrics
 
 
 def generate_sam_mask(image, mask_generator):
@@ -40,9 +39,15 @@ def process_dataset(dataset_name, image_dir, mask_dir, mask_generator, num_sampl
     
     for fname in selected_files:
         image_path = os.path.join(image_dir, fname)
-        mask_path = os.path.join(mask_dir, fname)  # Assumes same filename exists in mask_dir
+        if dataset_name == "COCO":
+            # For COCO, mask_path is the same JSON file for all images
+            mask_path = mask_dir
+        else:
+            # For DAVIS and VOC2012, mask files share the same filename as images
+            mask_path = os.path.join(mask_dir, fname)
+        
         try:
-            image, gt_mask = load_image_and_mask(image_path, mask_path)
+            image, gt_mask = load_image_and_mask(image_path, mask_path, dataset_type=dataset_name)
         except Exception as e:
             print(f"Skipping {fname}: {e}")
             continue
@@ -73,29 +78,39 @@ def main():
     # ---------------------------
     # Setup SAM Model
     # ---------------------------
-    sam_checkpoint = "path/to/sam_checkpoint.pth"  # <-- Specify path to your SAM checkpoint file
+    sam_checkpoint = "checkpoints/sam_vit_h_4b8939.pth"
     model_type = "vit_h"  # Options: "vit_h", "vit_l", "vit_b"
+    
+    if not os.path.exists(sam_checkpoint):
+        print(f"SAM checkpoint not found at {sam_checkpoint}. Please run download.py first.")
+        return
+    
     sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
     mask_generator = SamAutomaticMaskGenerator(sam)
     
     # ---------------------------
     # Define dataset paths
     # ---------------------------
-    # Make sure these directories point to the locations where you have stored the images and corresponding masks.
     datasets = {
-        "Pascal VOC": {
-            "image_dir": "path/to/VOC2012/JPEGImages",
-            "mask_dir": "path/to/VOC2012/SegmentationClass"
+        "DAVIS": {
+            "image_dir": "DAVIS/JPEGImages/480p",
+            "mask_dir": "DAVIS/Annotations/480p"
         },
         "COCO": {
-            "image_dir": "path/to/COCO/images",  # Adjust to your COCO image directory
-            "mask_dir": "path/to/COCO/masks"      # This should be a directory with preprocessed binary masks
+            "image_dir": "COCO/val2017",
+            "mask_dir": "COCO/annotations/instances_val2017.json"
         },
-        "DAVIS": {
-            "image_dir": "path/to/DAVIS/JPEGImages/480p",
-            "mask_dir": "path/to/DAVIS/Annotations/480p"
+        "VOC2012": {
+            "image_dir": "VOC2012/VOCdevkit/VOC2012/JPEGImages",
+            "mask_dir": "VOC2012/VOCdevkit/VOC2012/SegmentationObject"
         }
     }
+    
+    # Verify dataset paths exist
+    for name, paths in datasets.items():
+        if not os.path.exists(paths["image_dir"]) or not os.path.exists(paths["mask_dir"]):
+            print(f"Dataset {name} not found at specified paths. Please run download.py first.")
+            return
     
     results_iou = {}
     results_dice = {}

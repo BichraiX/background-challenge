@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import json
+import os
 
 # ---------------------------
 # Define segmentation metrics
@@ -21,21 +23,59 @@ def compute_dice(pred_mask, gt_mask):
 # ---------------------------
 # Utility functions
 # ---------------------------
-def load_image_and_mask(image_path, mask_path):
+def load_image_and_mask(image_path, mask_path, dataset_type=None):
     """
     Load an RGB image and its ground truth segmentation mask.
-    The mask is assumed to be a grayscale image where nonzero pixels are foreground.
+    Handles different dataset formats:
+    - DAVIS: Direct grayscale mask
+    - COCO: JSON annotations
+    - VOC2012: PNG segmentation masks
     """
+    # Load image
     image = cv2.imread(image_path)
     if image is None:
         raise ValueError(f"Unable to load image {image_path}")
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-    if mask is None:
-        raise ValueError(f"Unable to load mask {mask_path}")
-    # Convert to a binary mask: foreground if pixel > 0, else background.
-    binary_mask = mask > 0
+    # Handle different mask formats based on dataset type
+    if dataset_type == "COCO":
+        # For COCO, mask_path is the annotations JSON file
+        with open(mask_path, 'r') as f:
+            annotations = json.load(f)
+        
+        # Get image filename without extension
+        img_id = int(os.path.splitext(os.path.basename(image_path))[0])
+        
+        # Find annotations for this image
+        binary_mask = np.zeros(image.shape[:2], dtype=bool)
+        for ann in annotations['annotations']:
+            if ann['image_id'] == img_id:
+                # Convert RLE or polygon to mask
+                if 'segmentation' in ann:
+                    if isinstance(ann['segmentation'], dict):  # RLE format
+                        from pycocotools import mask as mask_utils
+                        rle = ann['segmentation']
+                        instance_mask = mask_utils.decode(rle)
+                    else:  # Polygon format
+                        from pycocotools import mask as mask_utils
+                        h, w = image.shape[:2]
+                        rles = mask_utils.frPyObjects(ann['segmentation'], h, w)
+                        instance_mask = mask_utils.decode(rles)
+                    binary_mask = np.logical_or(binary_mask, instance_mask.astype(bool))
+    
+    elif dataset_type == "VOC2012":
+        # For VOC2012, mask is a PNG file with instance segmentations
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Unable to load mask {mask_path}")
+        binary_mask = mask > 0
+    
+    else:  # Default DAVIS format
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Unable to load mask {mask_path}")
+        binary_mask = mask > 0
+
     return image, binary_mask
 
 def plot_metrics(metrics, metric_name):
