@@ -1,281 +1,344 @@
 import os
-import random
+import sys
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
+from PIL import Image
+import cv2
+import matplotlib.pyplot as plt
 from tqdm import tqdm
+import random
+import json
+from pycocotools import mask as mask_utils
 
-# Import SAM modules – make sure you have cloned Meta's SAM repo and installed its dependencies
-from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
-from utils import load_image_and_mask, compute_iou, compute_dice, plot_metrics
+# Add paths
+sys.path.append(os.path.join(os.getcwd(), "GroundingDINO"))
 
+# Grounding DINO
+import GroundingDINO.groundingdino.datasets.transforms as T
+from GroundingDINO.groundingdino.models import build_model
+from GroundingDINO.groundingdino.util.slconfig import SLConfig
+from GroundingDINO.groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
 
-def save_visualization(image, gt_mask, pred_mask, output_dir, filename):
-    """
-    Save visualization of original image, ground truth mask, and predicted mask.
-    Creates a side-by-side comparison image.
-    """
-    # Create figure with three subplots
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
-    
-    # Original image
-    ax1.imshow(image)
-    ax1.set_title('Original Image')
-    ax1.axis('off')
-    
-    # Ground truth mask
-    ax2.imshow(image)
-    ax2.imshow(gt_mask, alpha=0.5, cmap='Reds')
-    ax2.set_title('Ground Truth Mask')
-    ax2.axis('off')
-    
-    # Predicted mask
-    ax3.imshow(image)
-    ax3.imshow(pred_mask, alpha=0.5, cmap='Blues')
-    ax3.set_title('Predicted Mask')
-    ax3.axis('off')
-    
-    # Save the figure
-    os.makedirs(output_dir, exist_ok=True)
-    plt.savefig(os.path.join(output_dir, filename), bbox_inches='tight', dpi=150)
-    plt.close()
+# Segment Anything
+from segment_anything import sam_model_registry, SamPredictor
 
-def generate_sam_mask(image, mask_generator):
-    """
-    Use SAM's automatic mask generator to produce segmentation masks for an image.
-    Returns a single binary mask focusing on the main foreground object.
-    """
-    masks = mask_generator.generate(image)
-    
-    if not masks:
-        return np.zeros(image.shape[:2], dtype=bool)
-    
-    # Sort masks by area (descending) and confidence
-    sorted_masks = sorted(masks, key=lambda x: (x['area'], x['predicted_iou']), reverse=True)
-    
-    # Take the largest mask as the main foreground object
-    # This assumes the largest mask with high confidence is the main subject
-    main_mask = sorted_masks[0]['segmentation']
-    return main_mask
+# Utils
+from utils import compute_iou, compute_dice, plot_metrics
 
-def process_dataset(dataset_name, image_dir, mask_dir, mask_generator, num_samples=50):
-    """
-    Process a dataset:
-      - Randomly select num_samples images.
-      - For each image, load the ground truth mask, generate the predicted mask using SAM,
-        and compute IoU and Dice metrics.
-    Returns the average IoU and Dice across the processed images.
-    """
-    print(f"\nProcessing {dataset_name} dataset...")
+def load_image(image_path):
+    """Load and transform image for GroundingDINO."""
+    image_pil = Image.open(image_path).convert("RGB")
+    transform = T.Compose([
+        T.RandomResize([800], max_size=1333),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    image, _ = transform(image_pil, None)
+    return image_pil, image
+
+def load_model(model_config_path, model_checkpoint_path, device):
+    """Load GroundingDINO model."""
+    args = SLConfig.fromfile(model_config_path)
+    args.device = device
+    model = build_model(args)
+    checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
+    model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
+    model.eval()
+    return model
+
+def get_grounding_output(model, image, caption, box_threshold, text_threshold, device="cpu"):
+    """Get bounding boxes from GroundingDINO."""
+    caption = caption.lower()
+    caption = caption.strip()
+    if not caption.endswith("."):
+        caption = caption + "."
+    model = model.to(device)
+    image = image.to(device)
+    with torch.no_grad():
+        outputs = model(image[None], captions=[caption])
+    logits = outputs["pred_logits"].cpu().sigmoid()[0]
+    boxes = outputs["pred_boxes"].cpu()[0]
     
-    # Create results directory for this dataset
-    results_dir = os.path.join("results", dataset_name)
-    os.makedirs(results_dir, exist_ok=True)
+    # Filter output
+    logits_filt = logits.clone()
+    boxes_filt = boxes.clone()
+    filt_mask = logits_filt.max(dim=1)[0] > box_threshold
+    logits_filt = logits_filt[filt_mask]
+    boxes_filt = boxes_filt[filt_mask]
     
-    # Handle DAVIS dataset's subdirectory structure
-    if dataset_name == "DAVIS":
-        # Get all image files from all subdirectories
-        print("Collecting DAVIS image files from subdirectories...")
-        image_files = []
-        for subdir in os.listdir(image_dir):
-            subdir_path = os.path.join(image_dir, subdir)
-            if os.path.isdir(subdir_path):
-                for fname in os.listdir(subdir_path):
-                    if fname.lower().endswith(('.jpg', '.jpeg', '.png')):
-                        image_files.append((subdir, fname))
-    else:
-        # For other datasets, list image files directly
-        print(f"Collecting {dataset_name} image files...")
-        image_files = [(None, f) for f in os.listdir(image_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-    
-    if len(image_files) < num_samples:
-        print(f"Warning: {dataset_name} has only {len(image_files)} images; using all available images.")
-        num_samples = len(image_files)
-    else:
-        print(f"Found {len(image_files)} images, using {num_samples} random samples")
-    
-    selected_files = random.sample(image_files, num_samples)
-    
-    iou_list = []
-    dice_list = []
-    
-    # Create progress bar
-    pbar = tqdm(selected_files, desc=f"Processing {dataset_name}", unit="image")
-    
-    for file_info in pbar:
-        subdir, fname = file_info
-        if subdir:  # DAVIS dataset
-            image_path = os.path.join(image_dir, subdir, fname)
-            # For DAVIS, mask files are .png while images can be .jpg
-            mask_fname = os.path.splitext(fname)[0] + '.png'
-            mask_path = os.path.join(mask_dir, subdir, mask_fname)
-            # Use sequence name in output filename
-            output_fname = f"{subdir}_{os.path.splitext(fname)[0]}.png"
-        else:  # Other datasets
-            image_path = os.path.join(image_dir, fname)
-            output_fname = os.path.splitext(fname)[0] + '.png'
-            if dataset_name == "COCO":
-                mask_path = mask_dir  # For COCO, mask_path is the annotations JSON file
-            else:
-                # For VOC2012, mask files share the same filename as images
-                mask_path = os.path.join(mask_dir, fname)
-        
+    return boxes_filt
+
+def load_image_and_mask(image_path, mask_path, dataset_type=None):
+    """Load an RGB image and its ground truth segmentation mask."""
+    # Load image
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Unable to load image {image_path}")
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    # Handle different mask formats based on dataset type
+    if dataset_type == "COCO":
         try:
-            image, gt_mask = load_image_and_mask(image_path, mask_path, dataset_type=dataset_name)
-            
-            # Generate predicted foreground mask using SAM
-            pred_mask = generate_sam_mask(image, mask_generator)
-            
-            # Ensure masks have the same shape
-            if pred_mask.shape != gt_mask.shape:
-                pbar.write(f"Skipping {fname}: mask shape mismatch - pred: {pred_mask.shape}, gt: {gt_mask.shape}")
-                continue
-            
-            # Compute metrics
-            iou = compute_iou(pred_mask, gt_mask)
-            dice = compute_dice(pred_mask, gt_mask)
-            
-            # Save visualization
-            save_visualization(
-                image, gt_mask, pred_mask,
-                results_dir,
-                output_fname
-            )
-            
-            iou_list.append(iou)
-            dice_list.append(dice)
-            
-            # Update progress bar description with current metrics
-            current_iou = np.mean(iou_list)
-            current_dice = np.mean(dice_list)
-            pbar.set_postfix({
-                'IoU': f"{current_iou:.4f}",
-                'Dice': f"{current_dice:.4f}"
-            })
-            
+            with open(mask_path, 'r') as f:
+                annotations = json.load(f)
+            img_id = int(os.path.splitext(os.path.basename(image_path))[0])
+            h, w = image.shape[:2]
+            binary_mask = np.zeros((h, w), dtype=bool)
+            found_annotation = False
+            for ann in annotations['annotations']:
+                if ann['image_id'] == img_id:
+                    found_annotation = True
+                    if 'segmentation' in ann:
+                        if isinstance(ann['segmentation'], dict):  # RLE format
+                            current_mask = mask_utils.decode(ann['segmentation'])
+                        else:  # Polygon format
+                            rle = mask_utils.frPyObjects(ann['segmentation'], h, w)
+                            if isinstance(rle, list):
+                                rle = mask_utils.merge(rle)
+                            current_mask = mask_utils.decode(rle)
+                        if current_mask.ndim == 3:
+                            current_mask = np.any(current_mask, axis=2)
+                        binary_mask = np.logical_or(binary_mask, current_mask)
+            if not found_annotation:
+                raise ValueError(f"No annotation found for image {img_id}")
+            return image, binary_mask
         except Exception as e:
-            pbar.write(f"Skipping {fname}: {e}")
-            continue
+            print(f"Error processing COCO annotation for {image_path}: {str(e)}")
+            raise
     
-    avg_iou = np.mean(iou_list) if iou_list else 0
-    avg_dice = np.mean(dice_list) if dice_list else 0
+    elif dataset_type == "VOC2012":
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Unable to load mask {mask_path}")
+        binary_mask = mask > 0
     
-    print(f"\n{dataset_name} Results:")
-    print(f"  Average IoU  = {avg_iou:.4f}")
-    print(f"  Average Dice = {avg_dice:.4f}")
-    print(f"  Processed {len(iou_list)} images successfully")
-    print(f"  Results saved in: {os.path.abspath(results_dir)}")
-    return avg_iou, avg_dice
+    else:  # Default DAVIS format
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Unable to load mask {mask_path}")
+        binary_mask = mask > 0
 
+    return image, binary_mask
 
-def main():
-    random.seed(42)
+def get_class_prompt(dataset_type, image_path):
+    """Get the class name from dataset annotations."""
+    if dataset_type == "COCO":
+        ann_file = os.path.join("COCO", "annotations", "instances_val2017.json")
+        with open(ann_file, 'r') as f:
+            coco_data = json.load(f)
+        img_id = int(os.path.splitext(os.path.basename(image_path))[0])
+        for ann in coco_data['annotations']:
+            if ann['image_id'] == img_id:
+                cat_id = ann['category_id']
+                for cat in coco_data['categories']:
+                    if cat['id'] == cat_id:
+                        return cat['name']
+        return None
     
-    # ---------------------------
-    # Setup SAM Model
-    # ---------------------------
-    print("\nInitializing SAM model...")
-    sam_checkpoint = "checkpoints/sam_vit_h_4b8939.pth"
-    model_type = "vit_h"  # Options: "vit_h", "vit_l", "vit_b"
+    elif dataset_type == "VOC2012":
+        class_name = os.path.basename(image_path).split('_')[0]
+        return class_name
     
-    if not os.path.exists(sam_checkpoint):
-        print(f"SAM checkpoint not found at {sam_checkpoint}. Please run download.py first.")
-        return
+    elif dataset_type == "DAVIS":
+        sequence = os.path.basename(os.path.dirname(image_path))
+        return sequence
     
-    # Check if CUDA is available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    return None
+
+def show_mask(mask, ax, random_color=False):
+    """Display a mask on a given matplotlib axis."""
+    if random_color:
+        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+    else:
+        color = np.array([30/255, 144/255, 255/255, 0.6])
+    h, w = mask.shape[-2:]
+    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    ax.imshow(mask_image)
+
+def evaluate_sam(sam_checkpoint="checkpoints/sam_vit_h_4b8939.pth",
+                grounding_dino_config="GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
+                grounding_dino_checkpoint="groundingdino_swint_ogc.pth",
+                device="cpu"):
+    """Evaluate SAM on multiple datasets."""
+    print("Initializing models...")
     
-    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+    # Initialize SAM
+    sam = sam_model_registry["vit_h"](checkpoint=sam_checkpoint)
     sam.to(device=device)
+    predictor = SamPredictor(sam)
     
-    # Configure mask generator for foreground/background segmentation
-    mask_generator = SamAutomaticMaskGenerator(
-        model=sam,
-        points_per_side=32,  # Dense sampling for better coverage
-        pred_iou_thresh=0.90,  # Higher threshold for more confident predictions
-        stability_score_thresh=0.95,  # Higher threshold for more stable masks
-        crop_n_layers=0,  # No cropping to maintain global context
-        min_mask_region_area=1000,  # Larger minimum area to focus on main objects
-        output_mode="binary_mask",  # Binary mask output
-    )
+    # Initialize GroundingDINO
+    groundingdino = load_model(grounding_dino_config, grounding_dino_checkpoint, device)
     
-    # Create main results directory
-    os.makedirs("results", exist_ok=True)
-    print("\nResults will be saved in:", os.path.abspath("results"))
-    
-    # ---------------------------
-    # Define dataset paths
-    # ---------------------------
-    datasets = {
-        "DAVIS": {
-            "image_dir": "DAVIS/JPEGImages/480p",
-            "mask_dir": "DAVIS/Annotations/480p"
-        },
-        "COCO": {
-            "image_dir": "COCO/val2017",
-            "mask_dir": "COCO/annotations/instances_val2017.json"
-        },
-        "VOC2012": {
-            "image_dir": "VOC2012/VOCdevkit/VOC2012/JPEGImages",
-            "mask_dir": "VOC2012/VOCdevkit/VOC2012/SegmentationObject"
-        }
+    # Results dictionary
+    results = {
+        "COCO": {"iou": [], "dice": []},
+        "DAVIS": {"iou": [], "dice": []},
+        "VOC2012": {"iou": [], "dice": []}
     }
     
-    # Verify dataset paths exist
-    print("\nVerifying dataset paths...")
-    for name, paths in datasets.items():
-        if not os.path.exists(paths["image_dir"]) or not os.path.exists(paths["mask_dir"]):
-            print(f"Dataset {name} not found at specified paths. Please run download.py first.")
-            return
-        print(f"✓ {name} dataset found")
-    
-    results_iou = {}
-    results_dice = {}
-    
-    # ---------------------------
     # Process each dataset
-    # ---------------------------
-    for name, paths in datasets.items():
-        avg_iou, avg_dice = process_dataset(
-            name,
-            image_dir=paths["image_dir"],
-            mask_dir=paths["mask_dir"],
-            mask_generator=mask_generator,
-            num_samples=50
-        )
-        results_iou[name] = avg_iou
-        results_dice[name] = avg_dice
+    datasets = {
+        "COCO": "COCO/val2017",
+        "DAVIS": "DAVIS/JPEGImages/480p",
+        "VOC2012": "VOC2012/JPEGImages"
+    }
     
-    # Compute overall average (mean of the three datasets)
-    overall_iou = np.mean(list(results_iou.values()))
-    overall_dice = np.mean(list(results_dice.values()))
+    for dataset_name, dataset_path in datasets.items():
+        print(f"\nProcessing {dataset_name} dataset...")
+        
+        # Get list of images
+        images = []
+        for root, _, files in os.walk(dataset_path):
+            for f in files:
+                if f.endswith(('.jpg', '.jpeg', '.png')):
+                    images.append(os.path.join(root, f))
+        
+        if not images:
+            print(f"No images found in {dataset_path}")
+            continue
+        
+        # Randomly select 50 images
+        selected_images = random.sample(images, min(50, len(images)))
+        
+        # Process each image
+        for img_path in tqdm(selected_images):
+            try:
+                # Get corresponding mask path
+                if dataset_name == "COCO":
+                    mask_path = os.path.join("COCO", "annotations", "instances_val2017.json")
+                elif dataset_name == "DAVIS":
+                    mask_path = img_path.replace("JPEGImages", "Annotations").replace(".jpg", ".png")
+                else:  # VOC2012
+                    mask_path = img_path.replace("JPEGImages", "SegmentationClass").replace(".jpg", ".png")
+                
+                # Load image and ground truth
+                image, gt_mask = load_image_and_mask(img_path, mask_path, dataset_name)
+                
+                # Get class name and prepare text prompt
+                class_name = get_class_prompt(dataset_name, img_path)
+                if class_name is None:
+                    continue
+                
+                # Load and transform image for GroundingDINO
+                _, image_tensor = load_image(img_path)
+                
+                # Get bounding boxes from GroundingDINO
+                boxes_filt = get_grounding_output(
+                    model=groundingdino,
+                    image=image_tensor,
+                    caption=f"a {class_name}",
+                    box_threshold=0.35,
+                    text_threshold=0.25,
+                    device=device
+                )
+                
+                # Set image in predictor
+                predictor.set_image(image)
+                
+                # Convert boxes to the format expected by SAM
+                H, W = image.shape[:2]
+                boxes_xyxy = boxes_filt * torch.tensor([W, H, W, H])
+                boxes_xyxy[:, :2] -= boxes_xyxy[:, 2:] / 2
+                boxes_xyxy[:, 2:] += boxes_xyxy[:, :2]
+                
+                transformed_boxes = predictor.transform.apply_boxes_torch(boxes_xyxy, image.shape[:2])
+                
+                # Generate masks
+                masks, _, _ = predictor.predict_torch(
+                    point_coords=None,
+                    point_labels=None,
+                    boxes=transformed_boxes,
+                    multimask_output=False,
+                )
+                
+                if len(masks) == 0:
+                    print(f"No masks generated for {img_path}")
+                    continue
+                
+                # Combine all masks
+                pred_mask = torch.any(masks, dim=0).cpu().numpy()
+                
+                # Calculate metrics
+                iou = compute_iou(pred_mask, gt_mask)
+                dice = compute_dice(pred_mask, gt_mask)
+                
+                results[dataset_name]["iou"].append(iou)
+                results[dataset_name]["dice"].append(dice)
+                
+                # Save visualization
+                save_dir = os.path.join("results", dataset_name)
+                os.makedirs(save_dir, exist_ok=True)
+                
+                # Create visualization
+                fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+                
+                ax1.imshow(image)
+                ax1.set_title(f"Original Image\nClass: {class_name}")
+                ax1.axis('off')
+                
+                ax2.imshow(gt_mask, cmap='gray')
+                ax2.set_title("Ground Truth")
+                ax2.axis('off')
+                
+                ax3.imshow(image)
+                show_mask(pred_mask, ax3)
+                ax3.set_title(f"GroundingDINO + SAM\nIoU: {iou:.2f}, Dice: {dice:.2f}")
+                ax3.axis('off')
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_dir, f"{os.path.basename(img_path)}_result.png"))
+                plt.close()
+                
+            except Exception as e:
+                print(f"\nError processing {img_path}: {str(e)}")
+                continue
     
-    results_iou["Overall"] = overall_iou
-    results_dice["Overall"] = overall_dice
+    # Calculate and plot metrics
+    avg_metrics = {"iou": {}, "dice": {}}
     
-    print("\nFinal Results Summary:")
-    print("=" * 40)
-    for dataset in results_iou:
-        print(f"{dataset:8s}: IoU = {results_iou[dataset]:.4f}, Dice = {results_dice[dataset]:.4f}")
-    print("=" * 40)
+    for dataset_name in results:
+        if results[dataset_name]["iou"]:
+            avg_metrics["iou"][dataset_name] = np.mean(results[dataset_name]["iou"])
+            avg_metrics["dice"][dataset_name] = np.mean(results[dataset_name]["dice"])
     
-    # ---------------------------
-    # Plot the metrics as bar graphs
-    # ---------------------------
-    print("\nGenerating plots...")
-    # Save plots in results directory
-    plt.figure()
-    plot_metrics(results_iou, "Intersection over Union (IoU)")
-    plt.savefig("results/iou_comparison.png")
-    plt.close()
+    # Calculate overall averages
+    all_ious = []
+    all_dices = []
+    for dataset_name in results:
+        all_ious.extend(results[dataset_name]["iou"])
+        all_dices.extend(results[dataset_name]["dice"])
     
-    plt.figure()
-    plot_metrics(results_dice, "Dice Coefficient")
-    plt.savefig("results/dice_comparison.png")
-    plt.close()
-    
-    print("\nAll visualizations have been saved in:", os.path.abspath("results"))
+    if all_ious:
+        avg_metrics["iou"]["Overall"] = np.mean(all_ious)
+        avg_metrics["dice"]["Overall"] = np.mean(all_dices)
+        
+        # Plot results
+        plot_metrics(avg_metrics["iou"], "IoU")
+        plt.savefig("results/iou_comparison.png")
+        plt.close()
+        
+        plot_metrics(avg_metrics["dice"], "Dice Score")
+        plt.savefig("results/dice_comparison.png")
+        plt.close()
+        
+        # Print results
+        print("\nEvaluation Results:")
+        for dataset_name in results:
+            if dataset_name in avg_metrics["iou"]:
+                print(f"\n{dataset_name}:")
+                print(f"Average IoU: {avg_metrics['iou'][dataset_name]:.3f}")
+                print(f"Average Dice: {avg_metrics['dice'][dataset_name]:.3f}")
+        
+        print("\nOverall:")
+        print(f"Average IoU: {avg_metrics['iou']['Overall']:.3f}")
+        print(f"Average Dice: {avg_metrics['dice']['Overall']:.3f}")
+    else:
+        print("\nNo results were generated. Please check the dataset paths and annotations.")
 
 if __name__ == "__main__":
-    main()
+    # Create results directory
+    os.makedirs("results", exist_ok=True)
+    
+    # Run evaluation
+    evaluate_sam(device="cpu")  # Use CPU by default

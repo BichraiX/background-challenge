@@ -3,5 +3,6 @@ COCO/
 DAVIS/
 checkpoints/
 __pycache__/
+ImageNet
 *.pyc
 *.pyo
