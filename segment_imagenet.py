@@ -49,12 +49,12 @@ def load_model(model_config_path, model_checkpoint_path, device):
     args = SLConfig.fromfile(model_config_path)
     args.device = device
     model = build_model(args)
-    checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(model_checkpoint_path, map_location="cuda")
     model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
     model.eval()
     return model
 
-def get_grounding_output(model, image, caption, box_threshold, text_threshold, device="cpu"):
+def get_grounding_output(model, image, caption, box_threshold, text_threshold, device="cuda"):
     """Get bounding boxes from GroundingDINO."""
     caption = caption.lower()
     caption = caption.strip()
@@ -64,6 +64,7 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold, d
     image = image.to(device)
     with torch.no_grad():
         outputs = model(image[None], captions=[caption])
+    
     logits = outputs["pred_logits"].cpu().sigmoid()[0]
     boxes = outputs["pred_boxes"].cpu()[0]
     
@@ -74,7 +75,7 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold, d
     logits_filt = logits_filt[filt_mask]
     boxes_filt = boxes_filt[filt_mask]
     
-    return boxes_filt
+    return boxes_filt.to(device)  # Return boxes on the correct device
 
 def show_mask(mask, ax, random_color=False):
     """Display a mask on a given matplotlib axis."""
@@ -87,7 +88,7 @@ def show_mask(mask, ax, random_color=False):
     ax.imshow(mask_image)
 
 def save_masked_image(image, mask, output_path, is_foreground=True):
-    """Save image with mask applied, with grey background."""
+    """Save image with mask applied, with transparent background."""
     # Ensure mask does not have extra dimensions
     mask = np.squeeze(mask)  # This will remove dimensions of size 1
     
@@ -97,17 +98,17 @@ def save_masked_image(image, mask, output_path, is_foreground=True):
     image = image.convert("RGBA")
     image_array = np.array(image)
     
-    # Create grey background/foreground color
-    grey_color = np.array([128, 128, 128, 255])
+    # Create transparent background (alpha=0)
+    transparent = np.array([0, 0, 0, 0])
     
     if is_foreground:
-        # For foreground: keep masked area, make rest grey
+        # For foreground: keep masked area, make rest transparent
         mask_expanded = np.expand_dims(mask, axis=2)  # Now mask_expanded is (H, W, 1)
-        masked_image = np.where(mask_expanded, image_array, grey_color)
+        masked_image = np.where(mask_expanded, image_array, transparent)
     else:
-        # For background: keep unmasked area, make rest grey
+        # For background: keep unmasked area, make rest transparent
         mask_expanded = np.expand_dims(~mask, axis=2)
-        masked_image = np.where(mask_expanded, image_array, grey_color)
+        masked_image = np.where(mask_expanded, image_array, transparent)
     
     # Save the result
     result_image = Image.fromarray(masked_image.astype(np.uint8))
@@ -116,7 +117,7 @@ def save_masked_image(image, mask, output_path, is_foreground=True):
 
 def process_imagenet():
     """Process ImageNet images using GroundingDINO + SAM."""
-    device = "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
     # Initialize models
@@ -133,20 +134,22 @@ def process_imagenet():
         "groundingdino_swint_ogc.pth",
         device
     )
+    groundingdino.to(device)
     
     # Create output directory
-    os.makedirs("dataset", exist_ok=True)
+    os.makedirs("/Data/amine.chraibi/dataset", exist_ok=True)
     
     # Process each class
     for wordnet_id, class_name in WORDNET_TO_CLASS.items():
         print(f"\nProcessing class: {class_name}")
         
+        
         # Create class directory
-        class_dir = os.path.join("dataset", class_name.lower())
+        class_dir = os.path.join("/Data/amine.chraibi/dataset", class_name.lower())
         os.makedirs(class_dir, exist_ok=True)
         
         # Get list of images for this class
-        class_path = os.path.join("ImageNet", wordnet_id)
+        class_path = os.path.join("/Data/amine.chraibi/ImageNet/ImageNet_9_classes", wordnet_id)
         if not os.path.exists(class_path):
             print(f"Warning: Directory not found for {class_name} ({wordnet_id})")
             continue
@@ -160,6 +163,7 @@ def process_imagenet():
                 
                 # Load and transform image for GroundingDINO
                 image_pil, image_tensor = load_image(img_path)
+                image_tensor = image_tensor.to(device)
                 
                 # Get bounding boxes from GroundingDINO
                 boxes_filt = get_grounding_output(
@@ -171,6 +175,10 @@ def process_imagenet():
                     device=device
                 )
                 
+                if len(boxes_filt) == 0:
+                    print(f"No boxes found for {img_path}")
+                    continue
+                
                 # Load image for SAM
                 image = cv2.imread(img_path)
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -178,17 +186,19 @@ def process_imagenet():
                 
                 # Convert boxes to the format expected by SAM
                 H, W = image.shape[:2]
-                boxes_xyxy = boxes_filt * torch.tensor([W, H, W, H])
+                boxes_xyxy = boxes_filt * torch.tensor([W, H, W, H], device=device)
                 boxes_xyxy[:, :2] -= boxes_xyxy[:, 2:] / 2
                 boxes_xyxy[:, 2:] += boxes_xyxy[:, :2]
                 
-                transformed_boxes = predictor.transform.apply_boxes_torch(boxes_xyxy, image.shape[:2])
+                # Transform boxes and ensure they're on the correct device
+                transformed_boxes = predictor.transform.apply_boxes_torch(boxes_xyxy.cpu(), image.shape[:2])
+                transformed_boxes = transformed_boxes.to(device)
                 
                 # Generate masks
                 masks, _, _ = predictor.predict_torch(
                     point_coords=None,
                     point_labels=None,
-                    boxes=transformed_boxes.to(device),
+                    boxes=transformed_boxes,
                     multimask_output=False,
                 )
                 
