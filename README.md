@@ -46,7 +46,7 @@ Low-Rank Adaptation (LoRA) is a parameter-efficient fine-tuning technique that s
     * `only_fg`: Only foreground objects
   - Calculating and reporting per-category and global accuracy metrics
 
-  Results from the notebook show that the LoRA-fine-tuned model achieves approximately 65% accuracy across all attack categories, with particularly strong performance on the `original` (91.93%), `only_fg` (89.68%), and `mixed_same` (88.40%) categories. This represents a significant improvement over the standard ResNet50's 22% accuracy on adversarial backgrounds.
+  Results from the notebook show that the LoRA-fine-tuned model achieves approximately 69% accuracy across all attack categories, with particularly strong performance on the `original` (94%), as well as a significant improvement over the standard ResNet50's 22% accuracy on adversarial backgrounds.
 
 ### Data Processing
 
