@@ -162,17 +162,6 @@ For simplified evaluation without OFT components:
 python benchmark_simple.py --model_path model_final.pth
 ```
 
-## Results
-
-Our LoRA and OFT fine-tuned models achieve significant improvements in background robustness:
-
-- Standard ResNet50 on adversarial backgrounds: ~22% accuracy
-- LoRA fine-tuned ResNet50: ~65% accuracy across all attack categories
-  - Best performance on `original` (91.93%) and `only_fg` (89.68%)
-  - Most challenging categories: `only_bg_b` (12.72%) and `only_bg_t` (16.89%)
-- OFT fine-tuned ResNet50: ~84% accuracy across all attack categories
-
-The LoRA approach provides an excellent trade-off between model performance and training efficiency, as it requires fine-tuning only a small fraction of the parameters.
 
 ## Requirements
 
