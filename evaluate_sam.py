@@ -155,7 +155,7 @@ def show_mask(mask, ax, random_color=False):
     mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
     ax.imshow(mask_image)
 
-def evaluate_sam(sam_checkpoint="checkpoints/sam_vit_h_4b8939.pth",
+def evaluate_sam(sam_checkpoint="/Data/amine.chraibi/models/checkpoints/sam_vit_h_4b8939.pth",
                 grounding_dino_config="GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
                 grounding_dino_checkpoint="groundingdino_swint_ogc.pth",
                 device="cpu"):
